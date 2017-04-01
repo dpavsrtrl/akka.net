@@ -185,7 +185,7 @@ namespace Akka.Tests.Actor
 
                 if (!str.StartsWith("FROM1"))
                 {
-                    Self.Tell("FROM1" + str);
+                    Self.Tell("FROM1" + str, Sender);
                 }
             }
 
@@ -382,10 +382,10 @@ namespace Akka.Tests.Actor
             var bt = Sys.ActorOf(Props.Create(() => new ParallelLoopReceive(latch)));
 
             bt.Tell("A", TestActor);
-            bt.Tell("B", TestActor);
-
             ExpectMsg("FROM1AA");
-            ExpectMsg("FROM1AB");
+
+            bt.Tell("B", TestActor);
+            ExpectMsg("FROM1BB");
         }
     }
 }
