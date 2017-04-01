@@ -21,14 +21,23 @@ namespace Akka.Actor
         protected TreeMachine.ActionWF Execute(Action<TreeMachine.IContext> action)
             => new TreeMachine.ActionWF(action);
 
+        protected TreeMachine.ConditionWF Condition(Func<TreeMachine.IContext, bool> pred)
+            => new TreeMachine.ConditionWF(pred);
+
         protected TreeMachine.ReceiveAnyWF ReceiveAny(TreeMachine.IWorkflow child)
             => new TreeMachine.ReceiveAnyWF(child);
+
+        protected TreeMachine.ReceiveAnyWF ReceiveAny(Action<TreeMachine.IContext> action)
+            => ReceiveAny(Execute(action));
 
         protected TreeMachine.SequenceWF Sequence(params TreeMachine.IWorkflow[] children)
             => new TreeMachine.SequenceWF(children);
 
         protected TreeMachine.LoopWF Loop(TreeMachine.IWorkflow child)
             => new TreeMachine.LoopWF(child);
+
+        protected TreeMachine.ParallelWF Parallel(Func<IEnumerable<WorkflowStatus>, WorkflowStatus> statusEval, params TreeMachine.IWorkflow[] children)
+            => new TreeMachine.ParallelWF(statusEval, children);
 
         protected void StartWith(TreeMachine.IWorkflow wf, TData data)
         {
@@ -50,7 +59,7 @@ namespace Akka.Actor
 
             public bool ProcessMessage(object message)
             {
-                return _scopes.Select(s => s.ProcessMessage(new WFContext(Data, message))).ToList().Any();
+                return _scopes.Select(s => s.ProcessMessage(message)).ToList().Any();
             }
 
             public void Run(IWorkflow wf)
@@ -75,7 +84,7 @@ namespace Akka.Actor
                     CurrentMessage = message;
                 }
 
-                public object CurrentMessage { get; }
+                public object CurrentMessage { get; set; }
 
                 public TData GlobalData { get; }
 
@@ -96,22 +105,26 @@ namespace Akka.Actor
 
                 public abstract void Run(IContext context);
 
-                public bool IsComplete => Status == WorkflowStatus.Success || Status == WorkflowStatus.Failure;
+                public bool IsCompleted => Status == WorkflowStatus.Success || Status == WorkflowStatus.Failure;
 
                 public abstract void Reset();
             }
 
-            public class ScopeWF : WFBase, ITransfer
+            public class ScopeWF : WFBase, ITransmit
             {
-                private IWorkflow _child;
+                private IWorkflow _current;
                 private Stack<IWorkflow> _stack = new Stack<IWorkflow>();
+                private IContext _context;
 
                 public ScopeWF(IWorkflow child)
                 {
-                    _child = child;
-                    Status = _child.Status;
+                    _current = child;
+                    Status = _current.Status;
                 }
-                public IWorkflow Child => _child;
+                public IWorkflow Child => _current;
+
+                public bool RunAgain =>
+                    _current != null && !(_current as ITransmit)?.RunAgain == false;
 
                 public override void Reset()
                 {
@@ -120,16 +133,21 @@ namespace Akka.Actor
 
                 public override void Run(IContext context)
                 {
+                    if (IsCompleted)
+                        return;
+
+                    _context = context;
+
                     bool done = false;
                     do
                     {
-                        Status = _child.Status;
+                        Status = _current.Status;
 
-                        if (IsComplete)
+                        if (IsCompleted)
                         {
                             if (_stack.Count > 0)
                             {
-                                _child = _stack.Pop();
+                                _current = _stack.Pop();
                             }
                             else
                             {
@@ -138,46 +156,60 @@ namespace Akka.Actor
                         }
                         else
                         {
-                            if (!(_child is IReceive))
+                            if (!(_current is IReceive))
                             {
-                                _child.Run(context);
+                                _current.Run(context);
 
-                                var decorator = _child as IDecorator;
+                                var decorator = _current as IDecorator;
+                                var transmitter = _current as ITransmit;
+
                                 if (decorator != null)
                                 {
                                     if (decorator.Status == WorkflowStatus.Running)
                                     {
                                         _stack.Push(decorator);
 
-                                        _child = decorator.Next();
+                                        _current = decorator.Next();
                                     }
+                                }
+                                else if (transmitter?.RunAgain == false && transmitter.Status.IsCompleted() == false)
+                                {
+                                    done = true;
                                 }
                             }
                             else
                             {
                                 done = true;
                             }
+
                         }
                     } while (!done);
                 }
 
-                public bool ProcessMessage(IContext context)
+                public bool ProcessMessage(object message)
                 {
-                    if (IsComplete)
+                    _context.CurrentMessage = message;
+
+                    if (IsCompleted)
                         return false;
 
-                    var receiver = _child as IReceive;
+                    var transmitter = _current as ITransmit;
 
-                    if (receiver != null)
+                    if (transmitter != null)
                     {
-                        if (receiver.ProcessMessage(context.CurrentMessage))
+                        if (transmitter.ProcessMessage(message))
                         {
-                            if (!IsComplete)
+                            if (!IsCompleted)
                             {
-                                _stack.Push(_child);
-                                _child = receiver.Child;
+                                var receiver = transmitter as IReceive;
 
-                                Run(context);
+                                if (receiver != null)
+                                {
+                                    _stack.Push(_current);
+                                    _current = receiver.Child;
+                                }
+
+                                Run(_context);
                             }
 
                             return true;
@@ -201,6 +233,8 @@ namespace Akka.Actor
                     => _hasProcessed ? Child?.Status ?? WorkflowStatus.Success : WorkflowStatus.Undetermined;
 
                 public IWorkflow Child { get; }
+
+                public bool RunAgain => false;
 
                 public override void Reset()
                 {
@@ -255,6 +289,36 @@ namespace Akka.Actor
                 }
             }
 
+            public class ConditionWF : WFBase
+            {
+                private readonly Func<IContext, bool> _pred;
+
+                public ConditionWF(Func<IContext, bool> pred)
+                {
+                    _pred = pred;
+                }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public override void Run(IContext context)
+                {
+                    try
+                    {
+                        Status = _pred(context)
+                            ? WorkflowStatus.Success
+                            : WorkflowStatus.Failure;
+                    }
+                    catch (Exception ex)
+                    {
+                        Status = WorkflowStatus.Failure;
+                        Result = ex;
+                    }
+                }
+            }
+
             public class SequenceWF : WFBase, IDecorator
             {
                 private List<IWorkflow> _children;
@@ -297,7 +361,7 @@ namespace Akka.Actor
                         return;
                     }
 
-                    if (!IsComplete)
+                    if (!IsCompleted)
                     {
                         if (_pos >= _children.Count)
                         {
@@ -345,15 +409,56 @@ namespace Akka.Actor
                 }
             }
 
-            /// <summary>
-            /// Workflow Progress.
-            /// </summary>
-            public enum WorkflowStatus
+            public class ParallelWF : WFBase, ITransmit
             {
-                Undetermined,
-                Running,
-                Success,
-                Failure
+                private readonly Func<IEnumerable<WorkflowStatus>, WorkflowStatus> _statusEval;
+                private readonly List<ScopeWF> _children;
+
+                public bool RunAgain =>
+                    _children.Any(c => c.RunAgain);
+
+                public ParallelWF(Func<IEnumerable<WorkflowStatus>, WorkflowStatus> statusEval, params IWorkflow[] children)
+                {
+                    _statusEval = statusEval;
+                    _children = children.Select(c => new ScopeWF(c)).ToList();
+                }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                    _children.ForEach(c => c.Reset());
+                }
+
+                public override void Run(IContext context)
+                {
+                    if (Status.IsCompleted())
+                        return;
+
+                    _children.ForEach(c => c.Run(context));
+
+                    var states = _children.Select(c => c.Status).ToList();
+
+                    var status = _statusEval(states);
+
+                    if (!GetIsComplete(status) && (states.Count == 0 || states.All(GetIsComplete)))
+                    {
+                        Status = WorkflowStatus.Failure;
+                    }
+                    else
+                    {
+                        Status = status;
+                    }
+                }
+
+                private static bool GetIsComplete(WorkflowStatus s)
+                {
+                    return s == WorkflowStatus.Failure || s == WorkflowStatus.Success;
+                }
+
+                public bool ProcessMessage(object message)
+                {
+                    return _children.Select(c => c.ProcessMessage(message)).ToList().Any();
+                }
             }
 
             /// <summary>
@@ -397,7 +502,7 @@ namespace Akka.Actor
             {
                 TData GlobalData { get; }
 
-                object CurrentMessage { get; }
+                object CurrentMessage { get; set; }
 
                 IBlackboard ScopeData { get; }
             }
@@ -422,27 +527,33 @@ namespace Akka.Actor
                 IWorkflow Next();
             }
 
-            public interface ISplit : IWorkflow
+            public interface ISplit : ITransmit
             {
                 IWorkflow[] Children { get; }
             }
 
-            public interface ITransfer : IWorkflow
+            public interface ITransmit : IWorkflow
+            {
+                bool RunAgain { get; }
+                bool ProcessMessage(object message);
+
+            }
+
+            public interface IParent : IWorkflow
             {
                 IWorkflow Child { get; }
             }
 
-            public interface ISpawn : ITransfer
+            public interface ISpawn : ITransmit
             {
             }
 
-            public interface IBecome : ITransfer
+            public interface IBecome : ITransmit
             {
             }
 
-            public interface IReceive : ITransfer
+            public interface IReceive : ITransmit, IParent
             {
-                bool ProcessMessage(object message);
             }
 
             public interface IReceive<T> : IReceive
@@ -450,5 +561,88 @@ namespace Akka.Actor
                 bool ProcessMessage(T message);
             }
         }
+    }
+
+    /// <summary>
+    /// Workflow Progress.
+    /// </summary>
+    public enum WorkflowStatus
+    {
+        Undetermined,
+        Running,
+        Success,
+        Failure
+    }
+
+    public static class WorkflowEx
+    {
+        public static bool IsCompleted(this WorkflowStatus status)
+            => status == WorkflowStatus.Failure || status == WorkflowStatus.Success;
+
+        public static WorkflowStatus AllSucceed(this IEnumerable<WorkflowStatus> states)
+        {
+            return GetStatus(states, CalcAllSucceed);
+        }
+
+        public static WorkflowStatus FirstSucceed(this IEnumerable<WorkflowStatus> states)
+        {
+            return GetStatus(states, CalcFirstSucceed);
+        }
+
+        public static WorkflowStatus AnySucceed(this IEnumerable<WorkflowStatus> states)
+        {
+            return GetStatus(states, CalcAnySucceed);
+        }
+
+        private static WorkflowStatus GetStatus(IEnumerable<WorkflowStatus> states, CalcStatus calc)
+        {
+            bool hasFailure = false;
+            bool hasSuccess = false;
+            bool hasRunning = false;
+            bool hasUnknown = false;
+            bool hasAny = false;
+
+            foreach (var s in states)
+            {
+                hasFailure = s == WorkflowStatus.Failure;
+                hasSuccess = s == WorkflowStatus.Success;
+                hasRunning = s == WorkflowStatus.Running;
+                hasUnknown = s == WorkflowStatus.Undetermined;
+                hasAny = true;
+            }
+
+            return calc(hasFailure, hasSuccess, hasRunning, hasUnknown, hasAny);
+        }
+
+        private static WorkflowStatus CalcAllSucceed(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUnknown, bool hasAny)
+        {
+            return hasFailure
+                ? WorkflowStatus.Failure
+                : hasRunning || hasUnknown
+                    ? WorkflowStatus.Running
+                    : WorkflowStatus.Success;
+        }
+
+        private static WorkflowStatus CalcFirstSucceed(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUnknown, bool hasAny)
+        {
+            return !hasAny || hasFailure
+                ? WorkflowStatus.Failure
+                : hasSuccess
+                    ? WorkflowStatus.Success
+                    : WorkflowStatus.Running;
+        }
+
+        private static WorkflowStatus CalcAnySucceed(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUnknown, bool hasAny)
+        {
+            return !hasAny
+                ? WorkflowStatus.Failure
+                : hasSuccess
+                    ? WorkflowStatus.Success
+                    : hasRunning || hasUnknown
+                        ? WorkflowStatus.Running
+                        : WorkflowStatus.Failure;
+        }
+
+        private delegate WorkflowStatus CalcStatus(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUndetermined, bool hasAny);
     }
 }
