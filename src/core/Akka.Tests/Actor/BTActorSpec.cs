@@ -11,6 +11,7 @@ using System.Linq;
 using Akka.Actor;
 using Akka.TestKit;
 using Akka.Util.Internal;
+using FluentAssertions;
 using Xunit;
 
 namespace Akka.Tests.Actor
@@ -157,8 +158,8 @@ namespace Akka.Tests.Actor
             {
                 StartWith(Sequence(
                     Parallel(ss => ss.AllSucceed(),
-                        ReceiveAny(ctx => ctx.GlobalData.GetAndAdd(1)),
-                        ReceiveAny(ctx => ctx.GlobalData.GetAndAdd(4))),
+                        ReceiveAny(Execute(ctx => ctx.GlobalData.GetAndAdd(1))),
+                        ReceiveAny(Execute(ctx => ctx.GlobalData.GetAndAdd(4)))),
                     Execute(ctx => latch.CountDown())), counter);
             }
         }
@@ -167,42 +168,154 @@ namespace Akka.Tests.Actor
         {
             private static Random _rand = new Random((int)DateTime.Now.Ticks);
 
-            private string _str2 = string.Empty;
+            private Queue<string> _msgs1 = new Queue<string>();
+            private Queue<string> _msgs2 = new Queue<string>();
 
             public ParallelLoopReceive(TestLatch latch)
             {
                 StartWith(
                     Parallel(ss => ss.AllSucceed(),
-                        Loop(ReceiveAny(Process1)),
-                        Loop(ReceiveAny(Process2))), latch);
+                        Loop(ReceiveAny(Execute(Process1))),
+                        Loop(ReceiveAny(Execute(Process2)))), latch);
             }
 
             public void Process1(TreeMachine.IContext ctx)
             {
                 var str = ctx.CurrentMessage as string;
-                if (str == null)
-                    return;
-
-                if (!str.StartsWith("FROM1"))
+                if (str != null)
                 {
-                    Self.Tell("FROM1" + str, Sender);
+                    _msgs1.Enqueue(str);
+                    Self.Tell(new InternalMessage(), Sender);
                 }
             }
 
             public void Process2(TreeMachine.IContext ctx)
             {
                 var str = ctx.CurrentMessage as string;
-                if (str == null)
-                    return;
+                if (str != null)
+                {
+                    _msgs2.Enqueue(str);
+                }
 
-                if (str.StartsWith("FROM1") == false)
+                var intmsg = ctx.CurrentMessage as InternalMessage;
+                if (intmsg != null)
                 {
-                    _str2 = str;
+                    Sender.Tell($"1{_msgs1.Dequeue()}2{_msgs2.Dequeue()}");
                 }
-                else
+            }
+
+            public class InternalMessage { }
+        }
+
+        public class SequenceReceiveReverseThree : BT<TestLatch>
+        {
+            public SequenceReceiveReverseThree()
+            {
+                StartWith(
+                    ReceiveAny(
+                        Sequence(
+                            ReceiveAny(
+                                Sequence(
+                                    ReceiveAny(Execute(ReplyEcho)),
+                                    Execute(ReplyEcho))),
+                            Execute(ReplyEcho))), null);
+            }
+
+            private void ReplyEcho(TreeMachine.IContext ctx) => Sender.Tell(ctx.CurrentMessage);
+        }
+
+        public class BecomePingPong : BT<List<string>>
+        {
+            private TestLatch _latch;
+
+            public BecomePingPong(List<string> data, TestLatch latch)
+            {
+                _latch = latch;
+
+                StartWith(ReceiveAny(o => (o as string) == "RUN", Become(Ping)), data);
+            }
+
+            private TreeMachine.IWorkflow Done() =>
+                Condition(_ =>
                 {
-                    Sender.Tell(str + _str2);
-                }
+                    _latch.CountDown();
+                    return _latch.IsOpen;
+                });
+
+            private TreeMachine.IWorkflow WithDoneAndDone(TreeMachine.IWorkflow wf) =>
+                Sequence(
+                    Selector(
+                        Done(),
+                        wf),
+                    Execute(_ => Sender.Tell("DONE")));
+
+            private TreeMachine.IWorkflow Ping() =>
+                WithDoneAndDone(
+                    Receive<string>(s => s == "PING",
+                        Sequence(
+                            Execute(ctx =>
+                            {
+                                ctx.GlobalData.Add("PING");
+                                Self.Tell("PONG", Sender);
+                            }),
+                            Become(Pong))));
+
+            private TreeMachine.IWorkflow Pong() =>
+                WithDoneAndDone(
+                    Receive<string>(s => s == "PONG",
+                        Sequence(
+                            Execute(ctx =>
+                            {
+                                ctx.GlobalData.Add("PONG");
+                                Self.Tell("PING", Sender);
+                            }),
+                            Become(Ping))));
+        }
+
+        public class ParallelBecomer : BT<List<string>>
+        {
+            public ParallelBecomer()
+            {
+                StartWith(
+                    Parallel(ss => ss.AllSucceed(),
+                        Loop(Receive<string>(s => s == "THERE?", Execute(_ => Sender.Tell("HERE!")))),
+                        Parallel(ss => ss.AllSucceed(),
+                            Receive<string>(s => s == "KILL",
+                                Become(() =>
+                                    Sequence(
+                                        Execute(_ => Sender.Tell("I TRIED")),
+                                        Receive<string>(s => s == "THERE?", Execute(_ => Sender.Tell("I ATE HIM")))))))), null);
+            }
+        }
+
+        public class SpawnConfirm : BT<object>
+        {
+            public SpawnConfirm()
+            {
+                StartWith(
+                    Parallel(ss => ss.AllSucceed(),
+                        Loop(Receive<string>(s => s.Equals("THERE?"), Execute(_ => Sender.Tell("HERE!")))),
+                        Spawn(
+                            Receive<string>(s => s.Equals("KILL"),
+                                Become(() =>
+                                    Sequence(
+                                        Execute(_ => Sender.Tell("I TRIED")),
+                                        Receive<string>(s => s == "THERE?", Execute(_ => Sender.Tell("I ATE HIM")))))))), null);
+            }
+        }
+
+        public class LoopSpawn : BT<object>
+        {
+            public LoopSpawn()
+            {
+                StartWith(
+                    Loop(
+                        Spawn(
+                            ReceiveAny(
+                                Sequence(
+                                    Execute(_ => Sender.Tell("KARU")),
+                                    Become(() =>
+                                        ReceiveAny(Execute(_ => Sender.Tell("SEL")))))))), null);
             }
         }
 
@@ -382,10 +495,97 @@ namespace Akka.Tests.Actor
             var bt = Sys.ActorOf(Props.Create(() => new ParallelLoopReceive(latch)));
 
             bt.Tell("A", TestActor);
-            ExpectMsg("FROM1AA");
-
             bt.Tell("B", TestActor);
-            ExpectMsg("FROM1BB");
+            ExpectMsg("1A2A");
+            ExpectMsg("1B2B");
+
+            bt.Tell("C");
+            ExpectMsg("1C2C");
+            bt.Tell("D");
+            ExpectMsg("1D2D");
+        }
+
+        [Fact]
+        public void BTActor_RecoverCurrentMessage()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new SequenceReceiveReverseThree()));
+
+            foreach (var i in Enumerable.Range(1, 3))
+            {
+                bt.Tell(i.ToString(), TestActor);
+            }
+
+            foreach (var i in Enumerable.Range(1, 3).Reverse())
+            {
+                ExpectMsg(i.ToString());
+            }
+        }
+
+        [Fact]
+        public void BTActor_BecomePingPong()
+        {
+            var pipe = new List<string>();
+            var latch = new TestLatch(5);
+
+            var bt = Sys.ActorOf(Props.Create(() => new BecomePingPong(pipe, latch)));
+
+            bt.Tell("RUN", TestActor);
+            bt.Tell("PING", TestActor);
+
+            latch.Ready();
+
+            ExpectMsg("DONE");
+
+            Assert.Equal(new[] { "PING", "PONG", "PING", "PONG" }, pipe);
+        }
+
+        [Fact]
+        public void BTActor_Become_Is_Limited_By_Spawn_Scope()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new SpawnConfirm()));
+
+            bt.Tell("THERE?", TestActor);
+            ExpectMsg("HERE!");
+
+            bt.Tell("KILL", TestActor);
+            ExpectMsg("I TRIED");
+
+            bt.Tell("THERE?", TestActor);
+
+            ExpectMsgAllOf(3.Seconds(), "HERE!", "I ATE HIM");
+        }
+
+        [Fact]
+        public void BTActor_Become_Crosses_NonSpawn_Scopes()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new ParallelBecomer()));
+
+            bt.Tell("THERE?", TestActor);
+            ExpectMsg("HERE!");
+
+            bt.Tell("KILL", TestActor);
+            ExpectMsg("I TRIED");
+
+            bt.Tell("THERE?", TestActor);
+            ExpectMsg("I ATE HIM");
+
+            ExpectNoMsg(100);
+        }
+
+        [Fact]
+        public void BTActor_Spawn_Resets_To_Original_Workflow()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new LoopSpawn()));
+
+            bt.Tell(1, TestActor);
+            bt.Tell(1, TestActor);
+            bt.Tell(1, TestActor);
+            bt.Tell(1, TestActor);
+
+            ExpectMsg("KARU");
+            ExpectMsg("SEL");
+            ExpectMsg("KARU");
+            ExpectMsg("SEL");
         }
     }
 }

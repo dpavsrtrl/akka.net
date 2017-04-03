@@ -27,8 +27,17 @@ namespace Akka.Actor
         protected TreeMachine.ReceiveAnyWF ReceiveAny(TreeMachine.IWorkflow child)
             => new TreeMachine.ReceiveAnyWF(child);
 
-        protected TreeMachine.ReceiveAnyWF ReceiveAny(Action<TreeMachine.IContext> action)
-            => ReceiveAny(Execute(action));
+        protected TreeMachine.ReceiveAnyWF ReceiveAny(Func<object, bool> shouldHandle, TreeMachine.IWorkflow child)
+            => new TreeMachine.ReceiveAnyWF(shouldHandle, child);
+
+        protected TreeMachine.ReceiveWF<T> Receive<T>(TreeMachine.IWorkflow child)
+            => new TreeMachine.ReceiveWF<T>(child);
+
+        protected TreeMachine.ReceiveWF<T> Receive<T>(Func<T, bool> shouldHandle, TreeMachine.IWorkflow child)
+            => new TreeMachine.ReceiveWF<T>(shouldHandle, child);
+
+        protected TreeMachine.SelectorWF Selector(params TreeMachine.IWorkflow[] children)
+            => new TreeMachine.SelectorWF(children);
 
         protected TreeMachine.SequenceWF Sequence(params TreeMachine.IWorkflow[] children)
             => new TreeMachine.SequenceWF(children);
@@ -38,6 +47,12 @@ namespace Akka.Actor
 
         protected TreeMachine.ParallelWF Parallel(Func<IEnumerable<WorkflowStatus>, WorkflowStatus> statusEval, params TreeMachine.IWorkflow[] children)
             => new TreeMachine.ParallelWF(statusEval, children);
+
+        protected TreeMachine.BecomeWF Become(Func<TreeMachine.IWorkflow> factory)
+            => new TreeMachine.BecomeWF(factory);
+
+        protected TreeMachine.SpawnWF Spawn(TreeMachine.IWorkflow child)
+            => new TreeMachine.SpawnWF(child);
 
         protected void StartWith(TreeMachine.IWorkflow wf, TData data)
         {
@@ -64,29 +79,29 @@ namespace Akka.Actor
 
             public void Run(IWorkflow wf)
             {
-                _scopes.Add(new ScopeWF(wf));
+                _scopes.Add(new ScopeWF(wf, null));
                 Run();
             }
 
             public void Run()
             {
-                _scopes.ForEach(s => s.Run(new WFContext(Data)));
+                _scopes.ForEach(s => s.Run(new WFContext(Data, null, s)));
             }
 
             protected class WFContext : IContext
             {
-                public WFContext(TData data)
+                public WFContext(TData data, object message, ScopeWF root)
                 {
                     GlobalData = data;
-                }
-                public WFContext(TData data, object message) : this(data)
-                {
                     CurrentMessage = message;
+                    Root = root;
                 }
 
                 public object CurrentMessage { get; set; }
 
                 public TData GlobalData { get; }
+
+                public ScopeWF Root { get; }
 
                 public IBlackboard ScopeData
                 {
@@ -101,6 +116,7 @@ namespace Akka.Actor
             public abstract class WFBase : IWorkflow
             {
                 public virtual WorkflowStatus Status { get; protected set; }
+
                 public object Result { get; protected set; }
 
                 public abstract void Run(IContext context);
@@ -114,13 +130,18 @@ namespace Akka.Actor
             {
                 private IWorkflow _current;
                 private Stack<IWorkflow> _stack = new Stack<IWorkflow>();
+                private Stack<IContext> _contexts = new Stack<IContext>();
+                private ScopeWF _root;
+
                 private IContext _context;
 
-                public ScopeWF(IWorkflow child)
+                public ScopeWF(IWorkflow child, ScopeWF root = null)
                 {
                     _current = child;
                     Status = _current.Status;
+                    _root = root ?? this;
                 }
+
                 public IWorkflow Child => _current;
 
                 public bool RunAgain =>
@@ -129,6 +150,24 @@ namespace Akka.Actor
                 public override void Reset()
                 {
 
+                }
+
+                public void Become(Func<IWorkflow> factory, IContext context)
+                {
+                    _stack.Clear();
+                    _contexts.Clear();
+
+                    if (_root != this)
+                    {
+                        _current = null;
+                        Status = WorkflowStatus.Success;
+                        _root.Become(factory, context);
+                    }
+                    else
+                    {
+                        _current = factory();
+                        Run(context);
+                    }
                 }
 
                 public override void Run(IContext context)
@@ -147,6 +186,10 @@ namespace Akka.Actor
                         {
                             if (_stack.Count > 0)
                             {
+                                if (_current is IReceive)
+                                {
+                                    _context = _contexts.Pop();
+                                }
                                 _current = _stack.Pop();
                             }
                             else
@@ -156,9 +199,16 @@ namespace Akka.Actor
                         }
                         else
                         {
+                            var becomer = _current as IBecome;
+                            if (becomer != null)
+                            {
+                                Become(becomer.Factory, _context);
+                                return;
+                            }
+
                             if (!(_current is IReceive))
                             {
-                                _current.Run(context);
+                                _current.Run(_context);
 
                                 var decorator = _current as IDecorator;
                                 var transmitter = _current as ITransmit;
@@ -181,14 +231,14 @@ namespace Akka.Actor
                             {
                                 done = true;
                             }
-
                         }
                     } while (!done);
                 }
 
                 public bool ProcessMessage(object message)
                 {
-                    _context.CurrentMessage = message;
+                    var prev = _context;
+                    _context = new WFContext(_context.GlobalData, message, _root);
 
                     if (IsCompleted)
                         return false;
@@ -205,6 +255,7 @@ namespace Akka.Actor
 
                                 if (receiver != null)
                                 {
+                                    _contexts.Push(prev);
                                     _stack.Push(_current);
                                     _current = receiver.Child;
                                 }
@@ -220,13 +271,19 @@ namespace Akka.Actor
                 }
             }
 
-            public class ReceiveAnyWF : WFBase, IReceive<object>
+            public class ReceiveAnyWF : WFBase, IReceive
             {
                 private bool _hasProcessed;
+                private Func<object, bool> _shouldHandle;
 
                 public ReceiveAnyWF(IWorkflow child)
                 {
                     Child = child;
+                }
+
+                public ReceiveAnyWF(Func<object, bool> shouldHandle, IWorkflow child) : this(child)
+                {
+                    _shouldHandle = shouldHandle;
                 }
 
                 public override WorkflowStatus Status
@@ -251,9 +308,21 @@ namespace Akka.Actor
                 {
                     Status = Child?.Status ?? WorkflowStatus.Success;
 
-                    _hasProcessed = true;
+                    _hasProcessed = _shouldHandle == null || _shouldHandle(message);
 
                     return _hasProcessed;
+                }
+            }
+
+            public class ReceiveWF<T> : ReceiveAnyWF
+            {
+                public ReceiveWF(IWorkflow child) : base(o => o is T, child)
+                {
+                }
+
+                public ReceiveWF(Func<T, bool> shouldHandle, IWorkflow child)
+                    : base(o => o is T && shouldHandle((T)o), child)
+                {
                 }
             }
 
@@ -318,52 +387,47 @@ namespace Akka.Actor
                     }
                 }
             }
-
-            public class SequenceWF : WFBase, IDecorator
+            public class SelectorWF : SequentialBase
             {
-                private List<IWorkflow> _children;
-                private IWorkflow _current;
-                private int _pos = 0;
+                public SelectorWF(params IWorkflow[] children)
+                    : base(children) { }
 
-                public SequenceWF(params IWorkflow[] children)
+                public override void Run(IContext ctx)
                 {
-                    _children = new List<IWorkflow>(children);
-                }
-
-                public override void Reset()
-                {
-                    _pos = 0;
-                    _children.ForEach(c => c.Reset());
-                    Status = WorkflowStatus.Undetermined;
-                }
-
-                public IWorkflow Next()
-                {
-                    if (_pos < _children.Count)
+                    if (Current?.Status == WorkflowStatus.Success)
                     {
-                        _current = _children[_pos];
-                        _pos++;
-                    }
-                    else
-                    {
-                        _current = null;
-                    }
-
-                    return _current;
-                }
-
-                public override void Run(IContext context)
-                {
-                    if (_current?.Status == WorkflowStatus.Failure)
-                    {
-                        Status = WorkflowStatus.Failure;
-
-                        return;
+                        Status = WorkflowStatus.Success;
                     }
 
                     if (!IsCompleted)
                     {
-                        if (_pos >= _children.Count)
+                        if (CurrentPosition >= Children.Count)
+                        {
+                            Status = WorkflowStatus.Failure;
+                        }
+                        else
+                        {
+                            Status = WorkflowStatus.Running;
+                        }
+                    }
+                }
+            }
+
+            public class SequenceWF : SequentialBase
+            {
+                public SequenceWF(params IWorkflow[] children)
+                    : base(children) { }
+
+                public override void Run(IContext ctx)
+                {
+                    if (Current?.Status == WorkflowStatus.Failure)
+                    {
+                        Status = WorkflowStatus.Failure;
+                    }
+
+                    if (!IsCompleted)
+                    {
+                        if (CurrentPosition >= Children.Count)
                         {
                             Status = WorkflowStatus.Success;
                         }
@@ -372,6 +436,40 @@ namespace Akka.Actor
                             Status = WorkflowStatus.Running;
                         }
                     }
+                }
+            }
+
+            public abstract class SequentialBase : WFBase, IDecorator
+            {
+                protected SequentialBase(params IWorkflow[] children)
+                {
+                    Children = new List<IWorkflow>(children);
+                }
+
+                protected List<IWorkflow> Children { get; }
+                protected IWorkflow Current { get; set; }
+                protected int CurrentPosition { get; set; }
+
+                public override void Reset()
+                {
+                    CurrentPosition = 0;
+                    Children.ForEach(c => c.Reset());
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public IWorkflow Next()
+                {
+                    if (CurrentPosition < Children.Count)
+                    {
+                        Current = Children[CurrentPosition];
+                        CurrentPosition++;
+                    }
+                    else
+                    {
+                        Current = null;
+                    }
+
+                    return Current;
                 }
             }
 
@@ -412,7 +510,8 @@ namespace Akka.Actor
             public class ParallelWF : WFBase, ITransmit
             {
                 private readonly Func<IEnumerable<WorkflowStatus>, WorkflowStatus> _statusEval;
-                private readonly List<ScopeWF> _children;
+                private List<ScopeWF> _children;
+                private readonly IWorkflow[] _wfChildren;
 
                 public bool RunAgain =>
                     _children.Any(c => c.RunAgain);
@@ -420,7 +519,7 @@ namespace Akka.Actor
                 public ParallelWF(Func<IEnumerable<WorkflowStatus>, WorkflowStatus> statusEval, params IWorkflow[] children)
                 {
                     _statusEval = statusEval;
-                    _children = children.Select(c => new ScopeWF(c)).ToList();
+                    _wfChildren = children;
                 }
 
                 public override void Reset()
@@ -433,6 +532,13 @@ namespace Akka.Actor
                 {
                     if (Status.IsCompleted())
                         return;
+
+                    var wfContext = context as WFContext;
+
+                    if (_children == null)
+                    {
+                        _children = _wfChildren.Select(c => new ScopeWF(c, wfContext.Root)).ToList();
+                    }
 
                     _children.ForEach(c => c.Run(context));
 
@@ -458,6 +564,67 @@ namespace Akka.Actor
                 public bool ProcessMessage(object message)
                 {
                     return _children.Select(c => c.ProcessMessage(message)).ToList().Any();
+                }
+            }
+
+            public class BecomeWF : WFBase, IBecome
+            {
+                public BecomeWF(Func<IWorkflow> factory)
+                {
+                    Factory = factory;
+                }
+
+                public Func<IWorkflow> Factory { get; }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public override void Run(IContext context)
+                {
+                }
+            }
+
+            public class SpawnWF : WFBase, ITransmit
+            {
+                private IWorkflow _child;
+
+                public SpawnWF(IWorkflow child)
+                {
+                    _child = child;
+                }
+
+                public ScopeWF Scope { get; private set; }
+
+                public bool RunAgain
+                    => Scope.RunAgain;
+
+                public bool ProcessMessage(object message)
+                {
+                    return Scope.ProcessMessage(message);
+                }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                    _child.Reset();
+                    Scope = null;
+                }
+
+                public override void Run(IContext context)
+                {
+                    if (Status.IsCompleted())
+                        return;
+
+                    if (Scope == null)
+                    {
+                        Scope = new ScopeWF(_child);
+                    }
+
+                    Scope.Run(context);
+
+                    Status = Scope.Status;
                 }
             }
 
@@ -522,6 +689,11 @@ namespace Akka.Actor
             {
             }
 
+            public interface IBecome : IWorkflow
+            {
+                Func<IWorkflow> Factory { get; }
+            }
+
             public interface IDecorator : IWorkflow
             {
                 IWorkflow Next();
@@ -544,11 +716,7 @@ namespace Akka.Actor
                 IWorkflow Child { get; }
             }
 
-            public interface ISpawn : ITransmit
-            {
-            }
-
-            public interface IBecome : ITransmit
+            public interface ISpawn : IParent
             {
             }
 
