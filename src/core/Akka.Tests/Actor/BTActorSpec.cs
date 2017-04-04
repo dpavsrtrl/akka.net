@@ -319,6 +319,33 @@ namespace Akka.Tests.Actor
             }
         }
 
+        public class AllConditions : BT<object>
+        {
+            public AllConditions()
+            {
+                StartWith(
+                    ReceiveAny(
+                        Selector(
+                            Condition(x => x.CurrentMessage.Equals("NOT GO")),
+                            Sequence(
+                                Condition(x => x.CurrentMessage.Equals("GO")),
+                                Execute(_ => Sender.Tell("I GO")),
+                                ReceiveAny(
+                                    Condition(x => x.CurrentMessage.Equals("LEFT"),
+                                        Sequence(
+                                            Execute(_ => Sender.Tell("I LEFT")),
+                                            ReceiveAny(
+                                                Condition(x => x.CurrentMessage.Equals("LEFT"),
+                                                    @else: Sequence(
+                                                        Execute(_ => Sender.Tell("I RIGHT")),
+                                                        Loop(
+                                                            ReceiveAny(
+                                                                Condition(x => x.CurrentMessage.Equals("YES"),
+                                                                    @then: Execute(_ => Sender.Tell("I YES")),
+                                                                    @else: Execute(_ => Sender.Tell("I NO")))))))))))))), null);
+            }
+        }
+
         #endregion
 
         [Fact]
@@ -586,6 +613,28 @@ namespace Akka.Tests.Actor
             ExpectMsg("SEL");
             ExpectMsg("KARU");
             ExpectMsg("SEL");
+        }
+
+        [Fact]
+        public void BTActor_All_Conditions()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new AllConditions()));
+
+            bt.Tell("GO", TestActor);
+            bt.Tell("LEFT", TestActor);
+            bt.Tell("RIGHT", TestActor);
+            bt.Tell("YES");
+            bt.Tell("NO");
+            bt.Tell("NO");
+            bt.Tell("YES");
+
+            ExpectMsg("I GO");
+            ExpectMsg("I LEFT");
+            ExpectMsg("I RIGHT");
+            bt.Tell("I YES");
+            bt.Tell("I NO");
+            bt.Tell("I NO");
+            bt.Tell("I YES");
         }
     }
 }

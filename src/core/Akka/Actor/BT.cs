@@ -21,8 +21,8 @@ namespace Akka.Actor
         protected TreeMachine.ActionWF Execute(Action<TreeMachine.IContext> action)
             => new TreeMachine.ActionWF(action);
 
-        protected TreeMachine.ConditionWF Condition(Func<TreeMachine.IContext, bool> pred)
-            => new TreeMachine.ConditionWF(pred);
+        protected TreeMachine.ConditionWF Condition(Func<TreeMachine.IContext, bool> pred, TreeMachine.IWorkflow @then = null, TreeMachine.IWorkflow @else = null)
+            => new TreeMachine.ConditionWF(pred, @then, @else);
 
         protected TreeMachine.ReceiveAnyWF ReceiveAny(TreeMachine.IWorkflow child)
             => new TreeMachine.ReceiveAnyWF(child);
@@ -358,27 +358,50 @@ namespace Akka.Actor
                 }
             }
 
-            public class ConditionWF : WFBase
+            public class ConditionWF : WFBase, IDecorator
             {
                 private readonly Func<IContext, bool> _pred;
+                private readonly IWorkflow _then;
+                private readonly IWorkflow _else;
+                private IWorkflow _next;
 
-                public ConditionWF(Func<IContext, bool> pred)
+                public ConditionWF(Func<IContext, bool> pred, IWorkflow @then = null, IWorkflow @else = null)
                 {
                     _pred = pred;
+                    _then = @then;
+                    _else = @else;
+                }
+
+                public IWorkflow Next()
+                {
+                    return _next;
                 }
 
                 public override void Reset()
                 {
                     Status = WorkflowStatus.Undetermined;
+                    _next = null;
+                    _then?.Reset();
+                    _else?.Reset();
                 }
 
                 public override void Run(IContext context)
                 {
+                    if (_next != null)
+                    {
+                        Status = _next.Status;
+                        return;
+                    }
+
                     try
                     {
-                        Status = _pred(context)
+                        var status = _pred(context)
                             ? WorkflowStatus.Success
                             : WorkflowStatus.Failure;
+
+                        _next = status == WorkflowStatus.Success ? _then : _else;
+
+                        Status = _next != null ? WorkflowStatus.Running : status;
                     }
                     catch (Exception ex)
                     {
@@ -387,6 +410,7 @@ namespace Akka.Actor
                     }
                 }
             }
+
             public class SelectorWF : SequentialBase
             {
                 public SelectorWF(params IWorkflow[] children)
