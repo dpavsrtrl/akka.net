@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using Akka.Util.Internal;
 
 namespace Akka.Actor
 {
@@ -8,8 +9,13 @@ namespace Akka.Actor
     /// Behavior Tree Actor
     /// </summary>
     /// <typeparam name="TData">Global data object accessible to all scopes.</typeparam>
-    public class BT<TData> : UntypedActor
+    public class BT<TData> : UntypedActor, IMachineHost
     {
+        private class WFTimeout
+        {
+            public Guid Id { get; set; }
+        }
+
         protected TreeMachine Machine { get; set; }
 
         protected override void OnReceive(object message)
@@ -36,14 +42,32 @@ namespace Akka.Actor
         protected TreeMachine.ReceiveWF<T> Receive<T>(Func<T, bool> shouldHandle, TreeMachine.IWorkflow child)
             => new TreeMachine.ReceiveWF<T>(shouldHandle, child);
 
-        protected TreeMachine.SelectorWF Selector(params TreeMachine.IWorkflow[] children)
+        protected TreeMachine.SelectorWF AnySucceed(params TreeMachine.IWorkflow[] children)
             => new TreeMachine.SelectorWF(children);
 
-        protected TreeMachine.SequenceWF Sequence(params TreeMachine.IWorkflow[] children)
+        protected TreeMachine.SequenceWF AllSucceed(params TreeMachine.IWorkflow[] children)
             => new TreeMachine.SequenceWF(children);
+
+        protected TreeMachine.AllCompleteWF AllComplete(params TreeMachine.IWorkflow[] children)
+            => new TreeMachine.AllCompleteWF(children);
 
         protected TreeMachine.LoopWF Loop(TreeMachine.IWorkflow child)
             => new TreeMachine.LoopWF(child);
+
+        protected TreeMachine.ForeverWF Forever(TreeMachine.IWorkflow child)
+            => new TreeMachine.ForeverWF(child);
+
+        protected TreeMachine.WhileWF While(Func<TreeMachine.IContext, bool> pred, TreeMachine.IWorkflow child)
+            => new TreeMachine.WhileWF(pred, child);
+
+        protected TreeMachine.NotWF Not(TreeMachine.IWorkflow child)
+            => new TreeMachine.NotWF(child);
+
+        protected TreeMachine.FailWF Fail()
+            => new TreeMachine.FailWF();
+
+        protected TreeMachine.AfterWF After(TreeMachine.IWorkflow child, TreeMachine.IWorkflow after)
+            => new TreeMachine.AfterWF(child, after);
 
         protected TreeMachine.ParallelWF Parallel(Func<IEnumerable<WorkflowStatus>, WorkflowStatus> statusEval, params TreeMachine.IWorkflow[] children)
             => new TreeMachine.ParallelWF(statusEval, children);
@@ -54,10 +78,67 @@ namespace Akka.Actor
         protected TreeMachine.SpawnWF Spawn(TreeMachine.IWorkflow child)
             => new TreeMachine.SpawnWF(child);
 
+        protected TreeMachine.TimeoutWF Timeout(TimeSpan delay, TreeMachine.IWorkflow child, TreeMachine.IWorkflow onTimeout = null)
+            => new TreeMachine.TimeoutWF(delay, child, onTimeout ?? Fail());
+
+        protected TreeMachine.NeverWF Never()
+            => new TreeMachine.NeverWF();
+
+        protected TreeMachine.IWorkflow Delay(TimeSpan delay, TreeMachine.IWorkflow after = null)
+            => new TreeMachine.TimeoutWF(delay, Never(), after ?? Ok());
+
+        protected TreeMachine.OkWF Ok()
+            => new TreeMachine.OkWF();
+
         protected void StartWith(TreeMachine.IWorkflow wf, TData data)
         {
-            Machine = new TreeMachine(data, null);
+            Machine = new TreeMachine(data, null, this);
             Machine.Run(wf);
+        }
+
+        public IDisposable ScheduleMessage(TimeSpan delay, object message)
+        {
+            var cancel = new CancellableOnDispose(new Cancelable(Context.System.Scheduler));
+
+            Context.System.Scheduler.ScheduleTellOnce(delay, Self, message, Sender);
+
+            return cancel;
+        }
+
+        private class CancellableOnDispose : IDisposable
+        {
+            private bool _disposedValue = false; // To detect redundant calls
+
+            public CancellableOnDispose(ICancelable cancel)
+            {
+                Cancel = cancel;
+            }
+
+            public ICancelable Cancel { get; }
+
+            public void Dispose()
+            {
+                if (!_disposedValue)
+                {
+                    if (!Cancel.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            Cancel.Cancel(false);
+                        }
+                        catch { }
+                    }
+
+                    try
+                    {
+                        var toDispose = Cancel as IDisposable;
+                        toDispose?.Dispose();
+                    }
+                    catch { }
+
+                    _disposedValue = true;
+                }
+            }
         }
 
         public class TreeMachine
@@ -66,11 +147,14 @@ namespace Akka.Actor
 
             private IBlackboard _rootBb;
 
-            public TreeMachine(TData data, IBlackboard rootBb)
+            public TreeMachine(TData data, IBlackboard rootBb, IMachineHost host)
             {
                 Data = data;
                 _rootBb = rootBb;
+                Host = host;
             }
+
+            public IMachineHost Host { get; }
 
             public bool ProcessMessage(object message)
             {
@@ -85,16 +169,17 @@ namespace Akka.Actor
 
             public void Run()
             {
-                _scopes.ForEach(s => s.Run(new WFContext(Data, null, s)));
+                _scopes.ForEach(s => s.Run(new WFContext(Data, null, s, Host)));
             }
 
             protected class WFContext : IContext
             {
-                public WFContext(TData data, object message, ScopeWF root)
+                public WFContext(TData data, object message, ScopeWF root, IMachineHost host)
                 {
                     GlobalData = data;
                     CurrentMessage = message;
                     Root = root;
+                    Host = host;
                 }
 
                 public object CurrentMessage { get; set; }
@@ -110,6 +195,8 @@ namespace Akka.Actor
                         throw new NotImplementedException();
                     }
                 }
+
+                public IMachineHost Host { get; }
             }
             public TData Data { get; }
 
@@ -215,7 +302,7 @@ namespace Akka.Actor
 
                                 if (decorator != null)
                                 {
-                                    if (decorator.Status == WorkflowStatus.Running)
+                                    if (!decorator.Status.IsCompleted())
                                     {
                                         _stack.Push(decorator);
 
@@ -238,7 +325,7 @@ namespace Akka.Actor
                 public bool ProcessMessage(object message)
                 {
                     var prev = _context;
-                    _context = new WFContext(_context.GlobalData, message, _root);
+                    _context = new WFContext(_context.GlobalData, message, _root, ((WFContext)_context).Host);
 
                     if (IsCompleted)
                         return false;
@@ -306,6 +393,9 @@ namespace Akka.Actor
 
                 public virtual bool ProcessMessage(object message)
                 {
+                    if (message is WFTimeout)
+                        return false;
+
                     Status = Child?.Status ?? WorkflowStatus.Success;
 
                     _hasProcessed = _shouldHandle == null || _shouldHandle(message);
@@ -355,6 +445,45 @@ namespace Akka.Actor
                         Status = WorkflowStatus.Failure;
                         Result = ex;
                     }
+                }
+            }
+
+            public class NeverWF : WFBase
+            {
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public override void Run(IContext context)
+                {
+                    Status = WorkflowStatus.Running;
+                }
+            }
+
+            public class FailWF : WFBase
+            {
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public override void Run(IContext context)
+                {
+                    Status = WorkflowStatus.Failure;
+                }
+            }
+
+            public class OkWF : WFBase
+            {
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                }
+
+                public override void Run(IContext context)
+                {
+                    Status = WorkflowStatus.Success;
                 }
             }
 
@@ -425,7 +554,7 @@ namespace Akka.Actor
 
                     if (!IsCompleted)
                     {
-                        if (CurrentPosition >= Children.Count)
+                        if (CurrentPosition + 1 >= Children.Count)
                         {
                             Status = WorkflowStatus.Failure;
                         }
@@ -451,13 +580,62 @@ namespace Akka.Actor
 
                     if (!IsCompleted)
                     {
-                        if (CurrentPosition >= Children.Count)
+                        if (CurrentPosition + 1 >= Children.Count)
                         {
                             Status = WorkflowStatus.Success;
                         }
                         else
                         {
                             Status = WorkflowStatus.Running;
+                        }
+                    }
+                }
+            }
+
+            public class AllCompleteWF : SequentialBase
+            {
+                public AllCompleteWF(params IWorkflow[] children)
+                    : base(children) { }
+
+                public override void Run(IContext ctx)
+                {
+                    if (CurrentPosition + 1 >= Children.Count)
+                    {
+                        Status = WorkflowStatus.Success;
+                    }
+                    else
+                    {
+                        Status = WorkflowStatus.Running;
+                    }
+                }
+            }
+
+            public class AfterWF : SequentialBase
+            {
+                private WorkflowStatus _childStatus;
+                private IWorkflow _child;
+                private IWorkflow _after;
+
+                public AfterWF(IWorkflow child, IWorkflow after)
+                    : base(child, after)
+                {
+                    _child = child;
+                    _after = after;
+                }
+
+                public override void Run(IContext ctx)
+                {
+                    if (CurrentPosition <= 0)
+                    {
+                        _childStatus = Current?.Status ?? WorkflowStatus.Undetermined;
+                        Status = WorkflowStatus.Running;
+                    }
+                    else
+                    {
+                        var status = Current.Status;
+                        if (status.IsCompleted())
+                        {
+                            Status = _childStatus;
                         }
                     }
                 }
@@ -472,61 +650,191 @@ namespace Akka.Actor
 
                 protected List<IWorkflow> Children { get; }
                 protected IWorkflow Current { get; set; }
-                protected int CurrentPosition { get; set; }
+                protected int CurrentPosition { get; set; } = -1;
 
                 public override void Reset()
                 {
-                    CurrentPosition = 0;
+                    CurrentPosition = -1;
                     Children.ForEach(c => c.Reset());
                     Status = WorkflowStatus.Undetermined;
+                    Current = null;
                 }
 
                 public IWorkflow Next()
                 {
                     if (CurrentPosition < Children.Count)
                     {
-                        Current = Children[CurrentPosition];
                         CurrentPosition++;
-                    }
-                    else
-                    {
-                        Current = null;
+
+                        Current = CurrentPosition < Children.Count ? Children[CurrentPosition] : null;
                     }
 
                     return Current;
                 }
             }
 
-            public class LoopWF : WFBase, IDecorator
+            public class LoopWF : LoopBase
             {
-                private IWorkflow _child;
-
                 public LoopWF(IWorkflow child)
-                {
-                    _child = child;
-                }
-
-                public override void Reset()
-                {
-                    Status = WorkflowStatus.Undetermined;
-                    _child?.Reset();
-                }
-
-                public IWorkflow Next()
-                {
-                    _child?.Reset();
-                    return _child;
-                }
+                    : base(child) { }
 
                 public override void Run(IContext context)
                 {
-                    if (_child?.Status == WorkflowStatus.Failure)
+                    if (Child?.Status == WorkflowStatus.Failure)
                     {
                         Status = WorkflowStatus.Failure;
                     }
                     else
                     {
                         Status = WorkflowStatus.Running;
+                    }
+                }
+            }
+
+            public class ForeverWF : LoopBase
+            {
+                public ForeverWF(IWorkflow child)
+                    : base(child) { }
+
+                public override void Run(IContext context)
+                {
+                    Status = WorkflowStatus.Running;
+                }
+            }
+
+            public class NotWF : LoopBase
+            {
+                public NotWF(IWorkflow child)
+                    : base(child) { }
+
+                public override void Run(IContext context)
+                {
+                    Status = Child.Status == WorkflowStatus.Success
+                        ? WorkflowStatus.Failure : Child.Status == WorkflowStatus.Failure
+                            ? WorkflowStatus.Success : Child.Status;
+                }
+            }
+
+            public class WhileWF : LoopBase
+            {
+                private Func<IContext, bool> _pred;
+
+                public WhileWF(Func<IContext, bool> pred, IWorkflow child)
+                    : base(child)
+                {
+                    _pred = pred;
+                }
+
+                public override void Run(IContext context)
+                {
+                    Status = _pred(context) ? WorkflowStatus.Running : WorkflowStatus.Success;
+                }
+            }
+
+            public abstract class LoopBase : WFBase, IDecorator
+            {
+                protected LoopBase(IWorkflow child)
+                {
+                    Child = child;
+                }
+
+                protected IWorkflow Child { get; }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                    Child?.Reset();
+                }
+
+                public IWorkflow Next()
+                {
+                    Child?.Reset();
+                    return Child;
+                }
+            }
+
+            public class TimeoutWF : WFBase, ITransmit
+            {
+                private IWorkflow _child;
+                private TimeSpan _delay;
+                private IWorkflow _onTimeout;
+                private IDisposable _timeoutToken;
+                private Guid _timeoutId;
+                private bool _timedOut;
+
+                public TimeoutWF(TimeSpan delay, IWorkflow child, IWorkflow onTimeout)
+                {
+                    _delay = delay;
+                    _child = child;
+                    _onTimeout = onTimeout;
+                }
+
+                public bool RunAgain =>
+                        (!_timedOut
+                            ? (_child as ITransmit)?.RunAgain
+                            : (_onTimeout as ITransmit)?.RunAgain) ?? false;
+
+                public bool ProcessMessage(object message)
+                {
+                    if (Status.IsCompleted())
+                        return false;
+
+                    var tmsg = message as WFTimeout;
+                    if (tmsg?.Id == _timeoutId)
+                    {
+                        _timedOut = true;
+                        _timeoutToken.Dispose();
+
+                        return true;
+                    }
+
+                    if (!_timedOut)
+                    {
+                        return (_child as ITransmit)?.ProcessMessage(message) ?? false;
+                    }
+
+                    return (_onTimeout as ITransmit)?.ProcessMessage(message) ?? false;
+                }
+
+                public override void Reset()
+                {
+                    Status = WorkflowStatus.Undetermined;
+                    _child.Reset();
+                    _onTimeout?.Reset();
+                    _timeoutToken?.Dispose();
+                    _timeoutToken = null;
+                    _timedOut = false;
+                }
+
+                public override void Run(IContext context)
+                {
+                    if (Status.IsCompleted())
+                        return;
+
+                    if (_timeoutToken == null)
+                    {
+                        _timeoutId = Guid.NewGuid();
+                        _timeoutToken = ((WFContext)context).Host.ScheduleMessage(_delay, new WFTimeout { Id = _timeoutId });
+                        Status = WorkflowStatus.Running;
+                    }
+
+                    if (!_timedOut)
+                    {
+                        _child.Run(context);
+
+                        if (_child.Status.IsCompleted())
+                        {
+                            Status = _child.Status;
+                            _timeoutToken.Dispose();
+                        }
+                    }
+                    else
+                    {
+                        _onTimeout.Run(context);
+                        if (_onTimeout.Status.IsCompleted())
+                        {
+                            Status = _onTimeout.Status;
+                        }
                     }
                 }
             }
@@ -549,7 +857,8 @@ namespace Akka.Actor
                 public override void Reset()
                 {
                     Status = WorkflowStatus.Undetermined;
-                    _children.ForEach(c => c.Reset());
+                    _wfChildren.ForEach(c => c.Reset());
+                    _children = null;
                 }
 
                 public override void Run(IContext context)
@@ -755,6 +1064,11 @@ namespace Akka.Actor
         }
     }
 
+    public interface IMachineHost
+    {
+        IDisposable ScheduleMessage(TimeSpan delay, object message);
+    }
+
     /// <summary>
     /// Workflow Progress.
     /// </summary>
@@ -784,6 +1098,11 @@ namespace Akka.Actor
         public static WorkflowStatus AnySucceed(this IEnumerable<WorkflowStatus> states)
         {
             return GetStatus(states, CalcAnySucceed);
+        }
+
+        public static WorkflowStatus AllComplete(this IEnumerable<WorkflowStatus> states)
+        {
+            return GetStatus(states, CalcAllComplete);
         }
 
         private static WorkflowStatus GetStatus(IEnumerable<WorkflowStatus> states, CalcStatus calc)
@@ -822,6 +1141,13 @@ namespace Akka.Actor
                 : hasSuccess
                     ? WorkflowStatus.Success
                     : WorkflowStatus.Running;
+        }
+
+        private static WorkflowStatus CalcAllComplete(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUnknown, bool hasAny)
+        {
+            return hasRunning || hasUnknown
+                ? WorkflowStatus.Running
+                : WorkflowStatus.Success;
         }
 
         private static WorkflowStatus CalcAnySucceed(bool hasFailure, bool hasSuccess, bool hasRunning, bool hasUnknown, bool hasAny)

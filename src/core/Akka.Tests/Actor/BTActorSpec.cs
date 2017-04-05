@@ -72,7 +72,7 @@ namespace Akka.Tests.Actor
         {
             public SequenceOne(List<string> pipe, TestLatch latch)
             {
-                StartWith(Sequence(Execute(ctx => ctx.GlobalData.Add("1"))), pipe);
+                StartWith(AllSucceed(Execute(ctx => ctx.GlobalData.Add("1"))), pipe);
 
                 latch.CountDown();
             }
@@ -82,7 +82,7 @@ namespace Akka.Tests.Actor
         {
             public SequenceTwo(List<string> pipe, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     Execute(ctx => ctx.GlobalData.Add("1")),
                     Execute(ctx => ctx.GlobalData.Add("2"))), pipe);
 
@@ -94,7 +94,7 @@ namespace Akka.Tests.Actor
         {
             public SequenceReceive(List<string> pipe, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     Execute(ctx => ctx.GlobalData.Add("1")),
                     ReceiveAny(Execute(ctx => ctx.GlobalData.Add(ctx.CurrentMessage as string))),
                     Execute(ctx => latch.CountDown())), pipe);
@@ -105,12 +105,12 @@ namespace Akka.Tests.Actor
         {
             public SequenceReceiveSequenceReceive(List<string> pipe, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     ReceiveAny(Execute(ctx => ctx.GlobalData.Add(ctx.CurrentMessage as string))),
                     Execute(ctx => ctx.GlobalData.Add("2")),
-                    Sequence(),
-                    Sequence(
-                        ReceiveAny(Sequence(
+                    AllSucceed(),
+                    AllSucceed(
+                        ReceiveAny(AllSucceed(
                             Execute(ctx => ctx.GlobalData.Add(ctx.CurrentMessage as string)),
                             ReceiveAny(Execute(ctx => ctx.GlobalData.Add(ctx.CurrentMessage as string)))
                             ))
@@ -124,7 +124,7 @@ namespace Akka.Tests.Actor
             public LoopEcho()
             {
                 StartWith(Loop(
-                    Sequence(
+                    AllSucceed(
                         ReceiveAny(Execute(ctx => Sender.Tell(ctx.CurrentMessage))),
                         ReceiveAny(Execute(ctx => Sender.Tell(ctx.CurrentMessage))))), null);
             }
@@ -134,7 +134,7 @@ namespace Akka.Tests.Actor
         {
             public EmptyParallelOk(AtomicCounter counter, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     Parallel(ss => ss.AllSucceed()),
                     Execute(ctx => latch.CountDown())), counter);
             }
@@ -144,7 +144,7 @@ namespace Akka.Tests.Actor
         {
             public SequenceParallelExecute(AtomicCounter counter, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     Parallel(ss => ss.AllSucceed(),
                         Execute(ctx => ctx.GlobalData.GetAndAdd(1)),
                         Execute(ctx => ctx.GlobalData.GetAndAdd(4))),
@@ -156,7 +156,7 @@ namespace Akka.Tests.Actor
         {
             public SequenceParallelReceive(AtomicCounter counter, TestLatch latch)
             {
-                StartWith(Sequence(
+                StartWith(AllSucceed(
                     Parallel(ss => ss.AllSucceed(),
                         ReceiveAny(Execute(ctx => ctx.GlobalData.GetAndAdd(1))),
                         ReceiveAny(Execute(ctx => ctx.GlobalData.GetAndAdd(4)))),
@@ -213,9 +213,9 @@ namespace Akka.Tests.Actor
             {
                 StartWith(
                     ReceiveAny(
-                        Sequence(
+                        AllSucceed(
                             ReceiveAny(
-                                Sequence(
+                                AllSucceed(
                                     ReceiveAny(Execute(ReplyEcho)),
                                     Execute(ReplyEcho))),
                             Execute(ReplyEcho))), null);
@@ -243,8 +243,8 @@ namespace Akka.Tests.Actor
                 });
 
             private TreeMachine.IWorkflow WithDoneAndDone(TreeMachine.IWorkflow wf) =>
-                Sequence(
-                    Selector(
+                AllSucceed(
+                    AnySucceed(
                         Done(),
                         wf),
                     Execute(_ => Sender.Tell("DONE")));
@@ -252,7 +252,7 @@ namespace Akka.Tests.Actor
             private TreeMachine.IWorkflow Ping() =>
                 WithDoneAndDone(
                     Receive<string>(s => s == "PING",
-                        Sequence(
+                        AllSucceed(
                             Execute(ctx =>
                             {
                                 ctx.GlobalData.Add("PING");
@@ -263,7 +263,7 @@ namespace Akka.Tests.Actor
             private TreeMachine.IWorkflow Pong() =>
                 WithDoneAndDone(
                     Receive<string>(s => s == "PONG",
-                        Sequence(
+                        AllSucceed(
                             Execute(ctx =>
                             {
                                 ctx.GlobalData.Add("PONG");
@@ -282,7 +282,7 @@ namespace Akka.Tests.Actor
                         Parallel(ss => ss.AllSucceed(),
                             Receive<string>(s => s == "KILL",
                                 Become(() =>
-                                    Sequence(
+                                    AllSucceed(
                                         Execute(_ => Sender.Tell("I TRIED")),
                                         Receive<string>(s => s == "THERE?", Execute(_ => Sender.Tell("I ATE HIM")))))))), null);
             }
@@ -298,7 +298,7 @@ namespace Akka.Tests.Actor
                         Spawn(
                             Receive<string>(s => s.Equals("KILL"),
                                 Become(() =>
-                                    Sequence(
+                                    AllSucceed(
                                         Execute(_ => Sender.Tell("I TRIED")),
                                         Receive<string>(s => s == "THERE?", Execute(_ => Sender.Tell("I ATE HIM")))))))), null);
             }
@@ -312,7 +312,7 @@ namespace Akka.Tests.Actor
                     Loop(
                         Spawn(
                             ReceiveAny(
-                                Sequence(
+                                AllSucceed(
                                     Execute(_ => Sender.Tell("KARU")),
                                     Become(() =>
                                         ReceiveAny(Execute(_ => Sender.Tell("SEL")))))))), null);
@@ -325,24 +325,108 @@ namespace Akka.Tests.Actor
             {
                 StartWith(
                     ReceiveAny(
-                        Selector(
+                        AnySucceed(
                             Condition(x => x.CurrentMessage.Equals("NOT GO")),
-                            Sequence(
+                            AllSucceed(
                                 Condition(x => x.CurrentMessage.Equals("GO")),
                                 Execute(_ => Sender.Tell("I GO")),
                                 ReceiveAny(
                                     Condition(x => x.CurrentMessage.Equals("LEFT"),
-                                        Sequence(
+                                        AllSucceed(
                                             Execute(_ => Sender.Tell("I LEFT")),
                                             ReceiveAny(
                                                 Condition(x => x.CurrentMessage.Equals("LEFT"),
-                                                    @else: Sequence(
+                                                    @else: AllSucceed(
                                                         Execute(_ => Sender.Tell("I RIGHT")),
                                                         Loop(
                                                             ReceiveAny(
                                                                 Condition(x => x.CurrentMessage.Equals("YES"),
                                                                     @then: Execute(_ => Sender.Tell("I YES")),
                                                                     @else: Execute(_ => Sender.Tell("I NO")))))))))))))), null);
+            }
+        }
+
+        public class FailFails : BT<object>
+        {
+            public FailFails()
+            {
+                StartWith(
+                    AnySucceed(
+                        Fail(),
+                        ReceiveAny(Execute(_ => Sender.Tell(_.CurrentMessage)))), null);
+            }
+        }
+
+        public class NotFailSucceeds : BT<object>
+        {
+            public NotFailSucceeds()
+            {
+                StartWith(
+                    AnySucceed(
+                        Not(Fail()),
+                        ReceiveAny(Execute(_ => Sender.Tell(_.CurrentMessage)))), null);
+            }
+        }
+
+        public class FailAfterSuccess : BT<object>
+        {
+            public FailAfterSuccess(TestLatch latch, AtomicCounter counter)
+            {
+                StartWith(
+                    AllSucceed(
+                        AnySucceed(
+                            After(
+                                Execute(_ => counter.GetAndIncrement()),
+                                Fail()),
+                            Execute(_ => counter.GetAndIncrement())),
+                        Execute(_ => latch.CountDown())), null);
+            }
+        }
+
+        public class SuccessAfterFailure : BT<object>
+        {
+            public SuccessAfterFailure(TestLatch latch, AtomicCounter counter)
+            {
+                StartWith(
+                    AllSucceed(
+                        AllComplete(
+                            After(
+                                AllSucceed(
+                                    Execute(_ => counter.GetAndIncrement()),
+                                    Fail()),
+                                Not(Fail())),
+                            Execute(_ => counter.GetAndIncrement())),
+                        Execute(_ => latch.CountDown())), null);
+            }
+        }
+
+        public class TimeoutTest1 : BT<object>
+        {
+            public TimeoutTest1(TestLatch latch, AtomicCounter counter)
+            {
+                StartWith(
+                    Loop(
+                        ReceiveAny(s => s.Equals("RUN"),
+                            After(
+                                Timeout(TimeSpan.FromMilliseconds(500),
+                                   Delay(100.Milliseconds(), Execute(_ => counter.GetAndIncrement())),
+                                   Execute(_ => { counter.GetAndDecrement(); Sender.Tell("TIMEOUT"); })),
+                                Execute(_ => latch.CountDown())))), null);
+            }
+        }
+
+        public class TimeoutTest2 : BT<object>
+        {
+            public TimeoutTest2(TestLatch latch, AtomicCounter counter)
+            {
+                StartWith(
+                    Loop(
+                        ReceiveAny(s => s.Equals("RUN"),
+                            After(
+                                Timeout(TimeSpan.FromMilliseconds(100),
+                                   Delay(5.Seconds(), Execute(_ => counter.GetAndIncrement())),
+                                   Execute(_ => { counter.GetAndDecrement(); Sender.Tell("TIMEOUT"); })),
+                                Execute(_ => latch.CountDown())))), null);
             }
         }
 
@@ -482,7 +566,7 @@ namespace Akka.Tests.Actor
 
             var bt = Sys.ActorOf(Props.Create(() => new EmptyParallelOk(counter, latch)));
 
-            latch.Ready(TimeSpan.FromDays(1));
+            latch.Ready();
             Assert.Equal(0, counter.Current);
         }
 
@@ -509,7 +593,7 @@ namespace Akka.Tests.Actor
             bt.Tell(new object());
             bt.Tell(new object());
 
-            latch.Ready(TimeSpan.FromSeconds(1));
+            latch.Ready();
             Assert.Equal(5, counter.Current);
         }
 
@@ -635,6 +719,86 @@ namespace Akka.Tests.Actor
             bt.Tell("I NO");
             bt.Tell("I NO");
             bt.Tell("I YES");
+        }
+
+        [Fact]
+        public void BTActor_FailFails()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new FailFails()));
+
+            bt.Tell("SUCCESS", TestActor);
+            ExpectMsg("SUCCESS");
+        }
+
+        [Fact]
+        public void BTActor_NotFailSucceeds()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new NotFailSucceeds()));
+
+            bt.Tell("SUCCESS", TestActor);
+            ExpectNoMsg(200);
+        }
+
+        [Fact]
+        public void BTActor_Fail_After_Success_Succeeds()
+        {
+            TestLatch latch = new TestLatch();
+            AtomicCounter counter = new AtomicCounter(0);
+
+            var bt = Sys.ActorOf(Props.Create(() => new FailAfterSuccess(latch, counter)));
+
+            latch.Ready();
+            Assert.Equal(1, counter.Current);
+        }
+
+        [Fact]
+        public void BTActor_Success_After_Failure_Fails()
+        {
+            TestLatch latch = new TestLatch();
+            AtomicCounter counter = new AtomicCounter(0);
+
+            var bt = Sys.ActorOf(Props.Create(() => new SuccessAfterFailure(latch, counter)));
+
+            latch.Ready();
+            Assert.Equal(2, counter.Current);
+        }
+
+        [Fact]
+        public void BTActor_Long_Timeout_Short_Delay()
+        {
+            TestLatch latch = new TestLatch();
+            AtomicCounter counter = new AtomicCounter(0);
+
+            var bt = Sys.ActorOf(Props.Create(() => new TimeoutTest1(latch, counter)));
+
+            bt.Tell("RUN", TestActor);
+            latch.Ready();
+            latch.Reset();
+            bt.Tell("RUN", TestActor);
+
+            latch.Ready();
+            Assert.Equal(2, counter.Current);
+
+            ExpectNoMsg(200);
+        }
+
+        [Fact]
+        public void BTActor_Short_Timeout_Long_Delay()
+        {
+            TestLatch latch = new TestLatch(2);
+            AtomicCounter counter = new AtomicCounter(0);
+
+            var bt = Sys.ActorOf(Props.Create(() => new TimeoutTest2(latch, counter)));
+
+            bt.Tell("RUN", TestActor);
+            ExpectMsg("TIMEOUT");
+            bt.Tell("RUN", TestActor);
+            ExpectMsg("TIMEOUT");
+
+            latch.Ready();
+            Assert.Equal(-2, counter.Current);
+
+            ExpectNoMsg(100);
         }
     }
 }
