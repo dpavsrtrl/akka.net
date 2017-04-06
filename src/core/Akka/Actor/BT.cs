@@ -5,17 +5,20 @@ using Akka.Util.Internal;
 
 namespace Akka.Actor
 {
+    public abstract class BTBase : UntypedActor
+    {
+        public class WFTimeout
+        {
+            public Guid Id { get; set; }
+        }
+    }
+
     /// <summary>
     /// Behavior Tree Actor
     /// </summary>
     /// <typeparam name="TData">Global data object accessible to all scopes.</typeparam>
-    public class BT<TData> : UntypedActor, IMachineHost
+    public class BT<TData> : BTBase, IMachineHost
     {
-        private class WFTimeout
-        {
-            public Guid Id { get; set; }
-        }
-
         protected TreeMachine Machine { get; set; }
 
         protected override void OnReceive(object message)
@@ -98,11 +101,8 @@ namespace Akka.Actor
 
         public IDisposable ScheduleMessage(TimeSpan delay, object message)
         {
-            var cancel = new CancellableOnDispose(new Cancelable(Context.System.Scheduler));
-
-            Context.System.Scheduler.ScheduleTellOnce(delay, Self, message, Sender);
-
-            return cancel;
+            return new CancellableOnDispose(
+                Context.System.Scheduler.ScheduleTellOnceCancelable(delay, Self, message, Sender));
         }
 
         private class CancellableOnDispose : IDisposable
@@ -330,15 +330,15 @@ namespace Akka.Actor
                     if (IsCompleted)
                         return false;
 
-                    var transmitter = _current as ITransmit;
+                    var processor = _current as IProcessMessage;
 
-                    if (transmitter != null)
+                    if (processor != null)
                     {
-                        if (transmitter.ProcessMessage(message))
+                        if (processor.ProcessMessage(message))
                         {
                             if (!IsCompleted)
                             {
-                                var receiver = transmitter as IReceive;
+                                var receiver = processor as IReceive;
 
                                 if (receiver != null)
                                 {
@@ -377,8 +377,6 @@ namespace Akka.Actor
                     => _hasProcessed ? Child?.Status ?? WorkflowStatus.Success : WorkflowStatus.Undetermined;
 
                 public IWorkflow Child { get; }
-
-                public bool RunAgain => false;
 
                 public override void Reset()
                 {
@@ -448,8 +446,15 @@ namespace Akka.Actor
                 }
             }
 
-            public class NeverWF : WFBase
+            public class NeverWF : WFBase, ITransmit
             {
+                public bool RunAgain => false;
+
+                public bool ProcessMessage(object message)
+                {
+                    return false;
+                }
+
                 public override void Reset()
                 {
                     Status = WorkflowStatus.Undetermined;
@@ -761,6 +766,8 @@ namespace Akka.Actor
                 private IDisposable _timeoutToken;
                 private Guid _timeoutId;
                 private bool _timedOut;
+                private ITransmit _childScope;
+                private ITransmit _onTimeoutScope;
 
                 public TimeoutWF(TimeSpan delay, IWorkflow child, IWorkflow onTimeout)
                 {
@@ -770,9 +777,9 @@ namespace Akka.Actor
                 }
 
                 public bool RunAgain =>
-                        (!_timedOut
-                            ? (_child as ITransmit)?.RunAgain
-                            : (_onTimeout as ITransmit)?.RunAgain) ?? false;
+                    !_timedOut
+                        ? _childScope.RunAgain
+                        : _onTimeoutScope.RunAgain;
 
                 public bool ProcessMessage(object message)
                 {
@@ -790,17 +797,19 @@ namespace Akka.Actor
 
                     if (!_timedOut)
                     {
-                        return (_child as ITransmit)?.ProcessMessage(message) ?? false;
+                        return _childScope.ProcessMessage(message);
                     }
 
-                    return (_onTimeout as ITransmit)?.ProcessMessage(message) ?? false;
+                    return _onTimeoutScope.ProcessMessage(message);
                 }
 
                 public override void Reset()
                 {
                     Status = WorkflowStatus.Undetermined;
                     _child.Reset();
-                    _onTimeout?.Reset();
+                    _onTimeout.Reset();
+                    _childScope = null;
+                    _onTimeoutScope = null;
                     _timeoutToken?.Dispose();
                     _timeoutToken = null;
                     _timedOut = false;
@@ -811,6 +820,18 @@ namespace Akka.Actor
                     if (Status.IsCompleted())
                         return;
 
+                    var wfContext = context as WFContext;
+
+                    if (_childScope == null)
+                    {
+                        _childScope = (_child as ITransmit) ?? new ScopeWF(_child, wfContext.Root);
+                    }
+
+                    if (_onTimeoutScope == null)
+                    {
+                        _onTimeoutScope = (_onTimeout as ITransmit) ?? new ScopeWF(_onTimeout, wfContext.Root);
+                    }
+
                     if (_timeoutToken == null)
                     {
                         _timeoutId = Guid.NewGuid();
@@ -820,20 +841,21 @@ namespace Akka.Actor
 
                     if (!_timedOut)
                     {
-                        _child.Run(context);
+                        _childScope.Run(context);
 
-                        if (_child.Status.IsCompleted())
+                        if (_childScope.Status.IsCompleted())
                         {
-                            Status = _child.Status;
+                            Status = _childScope.Status;
                             _timeoutToken.Dispose();
                         }
                     }
                     else
                     {
-                        _onTimeout.Run(context);
-                        if (_onTimeout.Status.IsCompleted())
+                        _onTimeoutScope.Run(context);
+
+                        if (_onTimeoutScope.Status.IsCompleted())
                         {
-                            Status = _onTimeout.Status;
+                            Status = _onTimeoutScope.Status;
                         }
                     }
                 }
@@ -842,7 +864,7 @@ namespace Akka.Actor
             public class ParallelWF : WFBase, ITransmit
             {
                 private readonly Func<IEnumerable<WorkflowStatus>, WorkflowStatus> _statusEval;
-                private List<ScopeWF> _children;
+                private List<ITransmit> _children;
                 private readonly IWorkflow[] _wfChildren;
 
                 public bool RunAgain =>
@@ -870,7 +892,7 @@ namespace Akka.Actor
 
                     if (_children == null)
                     {
-                        _children = _wfChildren.Select(c => new ScopeWF(c, wfContext.Root)).ToList();
+                        _children = _wfChildren.Select(c => c as ITransmit ?? new ScopeWF(c, wfContext.Root)).ToList();
                     }
 
                     _children.ForEach(c => c.Run(context));
@@ -1004,6 +1026,8 @@ namespace Akka.Actor
 
                 object CurrentMessage { get; set; }
 
+                //object CurrentItem { get; set; }
+
                 IBlackboard ScopeData { get; }
             }
 
@@ -1037,11 +1061,9 @@ namespace Akka.Actor
                 IWorkflow[] Children { get; }
             }
 
-            public interface ITransmit : IWorkflow
+            public interface ITransmit : IProcessMessage
             {
                 bool RunAgain { get; }
-                bool ProcessMessage(object message);
-
             }
 
             public interface IParent : IWorkflow
@@ -1053,7 +1075,11 @@ namespace Akka.Actor
             {
             }
 
-            public interface IReceive : ITransmit, IParent
+            public interface IProcessMessage : IWorkflow
+            {
+                bool ProcessMessage(object message);
+            }
+            public interface IReceive : IProcessMessage, IParent
             {
             }
 

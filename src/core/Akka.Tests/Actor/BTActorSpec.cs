@@ -13,6 +13,7 @@ using Akka.TestKit;
 using Akka.Util.Internal;
 using FluentAssertions;
 using Xunit;
+using Random = System.Random;
 
 namespace Akka.Tests.Actor
 {
@@ -430,6 +431,64 @@ namespace Akka.Tests.Actor
             }
         }
 
+        public class WhileCountdown : BT<AtomicCounter>
+        {
+            public WhileCountdown(AtomicCounter counter)
+            {
+                StartWith(
+                    ReceiveAny(
+                        While(ctx => ctx.GlobalData.Current > 0,
+                            Execute(ctx =>
+                            {
+                                Sender.Tell(ctx.GlobalData.Current);
+                                ctx.GlobalData.GetAndDecrement();
+                            }))), counter);
+            }
+        }
+
+        public class TimeoutAllSucceed : BT<object>
+        {
+            public TimeoutAllSucceed(TestLatch latch)
+            {
+                StartWith(
+                    Timeout(30.Seconds(),
+                        AllSucceed(
+                            Execute(ctx => latch.CountDown())),
+                        Execute(ctx => { throw new TimeoutException(); })), null);
+            }
+        }
+
+        public class JustDelay : BT<object>
+        {
+            public JustDelay(TestLatch latch)
+            {
+                StartWith(
+                    Delay(100.Milliseconds(), Execute(ctx => latch.CountDown())), null);
+            }
+        }
+
+        public class ScheduleTellConstructor : BT<object>
+        {
+            public ScheduleTellConstructor(IActorRef receiver)
+            {
+                Context.System.Scheduler.ScheduleTellOnceCancelable(100.Milliseconds(), Self, "HELLO", receiver);
+
+                StartWith(
+                    ReceiveAny(Execute(ctx => Sender.Tell(ctx.CurrentMessage + " FROM ME"))), null);
+            }
+        }
+
+        public class ScheduleTellExecute : BT<object>
+        {
+            public ScheduleTellExecute(IActorRef receiver)
+            {
+                StartWith(
+                    AllSucceed(
+                        Execute(ctx => Context.System.Scheduler.ScheduleTellOnceCancelable(100.Milliseconds(), Self, "HELLO", receiver)),
+                        ReceiveAny(Execute(ctx => Sender.Tell(ctx.CurrentMessage + " FROM ME")))), null);
+            }
+        }
+
         #endregion
 
         [Fact]
@@ -799,6 +858,64 @@ namespace Akka.Tests.Actor
             Assert.Equal(-2, counter.Current);
 
             ExpectNoMsg(100);
+        }
+
+        [Fact]
+        public void BTActor_ReceiveAny_While()
+        {
+            AtomicCounter counter = new AtomicCounter(5);
+
+            var bt = Sys.ActorOf(Props.Create(() => new WhileCountdown(counter)));
+
+            bt.Tell("RUN", TestActor);
+
+            Enumerable.Range(1, 5).Reverse().ForEach(i => ExpectMsg(i));
+        }
+
+        [Fact]
+        public void BTActor_Timeout_Runs_AllSucceed()
+        {
+            var latch = new TestLatch();
+
+            var bt = Sys.ActorOf(Props.Create(() => new TimeoutAllSucceed(latch)));
+
+            latch.Ready();
+        }
+
+        [Fact]
+        public void BTActor_Delay_Simple()
+        {
+            var latch = new TestLatch();
+
+            var bt = Sys.ActorOf(Props.Create(() => new JustDelay(latch)));
+
+            latch.Ready();
+        }
+
+        [Fact]
+        public void BTActor_SchedulTell()
+        {
+            IScheduler scheduler = new HashedWheelTimerScheduler(Sys.Settings.Config, Log);
+
+            var cancellable = scheduler.ScheduleTellOnceCancelable(100.Milliseconds(), TestActor, "Test", ActorRefs.NoSender);
+
+            ExpectMsg("Test");
+
+            scheduler.AsInstanceOf<IDisposable>().Dispose();
+        }
+
+        [Fact]
+        public void BTActor_Schedule_Tell_In_Constructor()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new ScheduleTellConstructor(TestActor)));
+            ExpectMsg("HELLO FROM ME");
+        }
+
+        [Fact]
+        public void BTActor_Schedule_Tell_In_Execute()
+        {
+            var bt = Sys.ActorOf(Props.Create(() => new ScheduleTellExecute(TestActor)));
+            ExpectMsg("HELLO FROM ME");
         }
     }
 }
